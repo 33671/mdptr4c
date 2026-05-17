@@ -74,6 +74,8 @@ typedef struct {
     size_t cap_size;
     unsigned col;
     int is_header;
+    char **wrapped;     /* wrapped visual lines (malloc'd array of strings) */
+    int nwrapped;       /* number of wrapped lines */
 } TCell;
 
 #define MAX_TCELLS 512
@@ -99,6 +101,8 @@ typedef struct {
     char code_lang[64];
 
     int in_html_block;
+
+    int max_width;     /* maximum rendering width (0 = unlimited) */
 
     /* table state */
     int tbl_active;
@@ -190,6 +194,124 @@ static int dispw(const char *s) {
         }
     }
     return n;
+}
+
+/* ── wrap ANSI-styled text into lines ────────────────────────── */
+
+#define MIN_COL_WIDTH 3
+
+/* Wrap ANSI-styled text into lines of at most `max_w` display width.
+ * Each line is properly styled by replaying active ANSI codes at its start.
+ * Returns malloc'd array of malloc'd strings; sets *nlines. */
+static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
+    if (!styled) styled = "";
+    if (max_w < MIN_COL_WIDTH) max_w = MIN_COL_WIDTH;
+
+    size_t len = strlen(styled);
+    size_t pos = 0;
+
+    /* dynamic array for collecting lines */
+    char **lines = NULL;
+    int line_cap = 0;
+    *nlines = 0;
+
+    while (pos < len) {
+        size_t line_start = pos;
+        int col = 0;
+        int last_break = -1;   /* byte position of last space */
+
+        /* scan characters in this visual line */
+        int line_full = 0;
+        while (pos < len && !line_full) {
+            unsigned char c = (unsigned char)styled[pos];
+
+            if (c == '\033') {
+                /* skip ANSI escape sequence */
+                while (pos < len && styled[pos] != 'm') pos++;
+                if (pos < len) pos++;  /* skip 'm' */
+                continue;
+            }
+
+            if (c == ' ') {
+                last_break = (int)pos;
+            }
+
+            int cb, cw;
+            cw = utf8_char_width(styled + pos, &cb);
+            if (cw <= 0) { cw = 1; cb = 1; }
+
+            if (col + cw > max_w) {
+                if (last_break >= 0 && last_break > (int)line_start) {
+                    /* break at last space (word boundary) */
+                    pos = (size_t)(last_break + 1);
+                }
+                /* else: hard break at current pos (mid-word) */
+                line_full = 1;
+            } else {
+                col += cw;
+                pos += cb;
+            }
+        }
+
+        size_t line_end = pos;
+
+        /* trim trailing spaces */
+        while (line_end > line_start && styled[line_end - 1] == ' ') line_end--;
+
+        /* determine active ANSI prefix at line_start by scanning from 0 */
+        char prefix[512] = {0};
+        int plen = 0;
+        size_t si = 0;
+        while (si < line_start) {
+            if (styled[si] == '\033') {
+                size_t ss = si;
+                while (si < line_start && styled[si] != 'm') si++;
+                if (si < line_start) si++;
+                int sl = (int)(si - ss);
+                if (sl >= 3 && styled[ss + 2] == '0' &&
+                    (sl == 4 || styled[ss + 3] == 'm')) {
+                    plen = 0;  /* ANSI_RESET clears active codes */
+                } else if (plen + sl < (int)sizeof(prefix) - 1) {
+                    memcpy(prefix + plen, styled + ss, sl);
+                    plen += sl;
+                    prefix[plen] = '\0';
+                }
+            } else {
+                si++;
+            }
+        }
+
+        /* build line: prefix + content + ANSI_RESET */
+        size_t content_len = line_end - line_start;
+        char *line = malloc(plen + content_len + 5);
+        if (!line) { fprintf(stderr, "malloc failed\n"); exit(1); }
+        if (plen > 0) memcpy(line, prefix, plen);
+        if (content_len > 0)
+            memcpy(line + plen, styled + line_start, content_len);
+        memcpy(line + plen + content_len, "\033[0m", 4);
+        line[plen + content_len + 4] = '\0';
+
+        /* add to lines array */
+        if (*nlines >= line_cap) {
+            line_cap = line_cap ? line_cap * 2 : 8;
+            lines = realloc(lines, (size_t)line_cap * sizeof(char *));
+            if (!lines) { fprintf(stderr, "realloc failed\n"); exit(1); }
+        }
+        lines[*nlines] = line;
+        (*nlines)++;
+
+        /* skip leading spaces for next line */
+        while (pos < len && styled[pos] == ' ') pos++;
+    }
+
+    if (*nlines == 0) {
+        lines = malloc(sizeof(char *));
+        if (!lines) { fprintf(stderr, "malloc failed\n"); exit(1); }
+        lines[0] = strdup("");
+        *nlines = 1;
+    }
+
+    return lines;
 }
 
 /* ── output text with line-prefix support ────────────────────── */
@@ -373,6 +495,8 @@ static int enter_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
         if (!g_out) { fprintf(stderr, "open_memstream failed\n"); exit(1); }
         c->tbl_cells[c->tbl_ncell].col = c->tbl_col;
         c->tbl_cells[c->tbl_ncell].is_header = (type == MD_BLOCK_TH);
+        c->tbl_cells[c->tbl_ncell].wrapped = NULL;
+        c->tbl_cells[c->tbl_ncell].nwrapped = 0;
         break;
     }
 
@@ -450,30 +574,80 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
 
     case MD_BLOCK_TABLE: {
         c->tbl_active = 0;
-        /* render captured table */
         int i;
+        int ncols = (int)c->tbl_cols;
 
-        /* calculate column widths */
-        int colw[32] = {0};
+        /* ── 1. calculate original column widths ──────────── */
+        int orig_colw[32] = {0};
         for (i = 0; i < c->tbl_ncell; i++) {
             TCell *cell = &c->tbl_cells[i];
             int w = cell->styled ? dispw(cell->styled) : 0;
-            if (w > colw[cell->col]) colw[cell->col] = w;
+            if (w > orig_colw[cell->col]) orig_colw[cell->col] = w;
         }
-        for (i = 0; i < (int)c->tbl_cols; i++) {
-            if (colw[i] < 3) colw[i] = 3;
+        for (i = 0; i < ncols; i++) {
+            if (orig_colw[i] < MIN_COL_WIDTH) orig_colw[i] = MIN_COL_WIDTH;
         }
 
-        /* helper: print a horizontal border */
-        #define BORDER(left, mid, right, dash) \
-            out_str(left); \
-            for (int ci = 0; ci < (int)c->tbl_cols; ci++) { \
-                for (int j = 0; j < colw[ci]; j++) out_str(dash); \
-                if (ci < (int)c->tbl_cols - 1) out_str(mid); \
-            } \
-            out_str(right ANSI_RESET "\n");
+        /* ── 2. adjust colw if max_width is set ──────────── */
+        int colw[32];
+        memcpy(colw, orig_colw, sizeof(colw));
 
-        /* count header rows (rows where first cell is_header) */
+        if (c->max_width > 0) {
+            int total_orig = 0;
+            for (i = 0; i < ncols; i++) total_orig += orig_colw[i];
+            int borders = ncols + 1;   /* outer + inner separators */
+            int total = total_orig + borders;
+
+            if (total > c->max_width) {
+                int avail = c->max_width - borders;
+                /* start each column at MIN_COL_WIDTH */
+                for (i = 0; i < ncols; i++) colw[i] = MIN_COL_WIDTH;
+                int used = ncols * MIN_COL_WIDTH;
+                int remain = avail - used;
+
+                /* greedy: keep giving extra width to the column that
+                 * currently has the largest gap to its original width */
+                while (remain > 0) {
+                    int best = -1;
+                    int best_gap = -1;
+                    for (i = 0; i < ncols; i++) {
+                        int gap = orig_colw[i] - colw[i];
+                        if (gap > best_gap) {
+                            best_gap = gap;
+                            best = i;
+                        }
+                    }
+                    if (best < 0 || best_gap <= 0) break;
+                    colw[best]++;
+                    remain--;
+                }
+            }
+        }
+
+        /* ── 3. wrap cell content ────────────────────────── */
+        for (i = 0; i < c->tbl_ncell; i++) {
+            TCell *cell = &c->tbl_cells[i];
+            cell->wrapped = wrap_styled_text(cell->styled,
+                                             colw[cell->col],
+                                             &cell->nwrapped);
+        }
+
+        /* ── 4. find max visual lines per logical row ───── */
+        int row_lines[MAX_TROWS];
+        for (int ri = 0; ri < c->tbl_nrow; ri++) {
+            int start = c->tbl_row_start[ri];
+            int end = (ri + 1 < c->tbl_nrow)
+                          ? c->tbl_row_start[ri + 1]
+                          : c->tbl_ncell;
+            int mx = 1;
+            for (int cj = start; cj < end; cj++) {
+                if (c->tbl_cells[cj].nwrapped > mx)
+                    mx = c->tbl_cells[cj].nwrapped;
+            }
+            row_lines[ri] = mx;
+        }
+
+        /* ── 5. count header rows ────────────────────────── */
         int header_rows = 0;
         for (i = 0; i < c->tbl_nrow; i++) {
             int start = c->tbl_row_start[i];
@@ -483,58 +657,73 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
                 break;
         }
 
+        /* helper macro for horizontal borders */
+        #define BORDER(left, mid, right, dash) \
+            out_str(left); \
+            for (int ci = 0; ci < ncols; ci++) { \
+                for (int j = 0; j < colw[ci]; j++) out_str(dash); \
+                if (ci < ncols - 1) out_str(mid); \
+            } \
+            out_str(right ANSI_RESET "\n");
+
+        /* ── 6. render ───────────────────────────────────── */
         /* top border */
         BORDER("\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90", "\xe2\x94\x80");
 
-        /* render rows */
         for (int ri = 0; ri < c->tbl_nrow; ri++) {
             int start = c->tbl_row_start[ri];
-            int end = (ri + 1 < c->tbl_nrow) ? c->tbl_row_start[ri + 1] : c->tbl_ncell;
+            int end = (ri + 1 < c->tbl_nrow)
+                          ? c->tbl_row_start[ri + 1]
+                          : c->tbl_ncell;
+            int rlines = row_lines[ri];
 
-            /* cell row */
-            for (int ci = 0; ci < (int)c->tbl_cols; ci++) {
-                MD_ALIGN a = c->tbl_aligns[ci];
-                out_str(ANSI_RESET "\xe2\x94\x82");
-                /* find cell for this column */
-                int found = 0;
-                for (int cj = start; cj < end; cj++) {
-                    if (c->tbl_cells[cj].col == (unsigned)ci) {
-                        TCell *cell = &c->tbl_cells[cj];
-                        int cw = cell->styled ? dispw(cell->styled) : 0;
-                        int pad = colw[ci] - cw;
-                        if (a == MD_ALIGN_RIGHT) {
-                            for (int p = 0; p < pad; p++) out_char(' ');
-                            if (cell->styled) out_str(cell->styled);
-                        } else if (a == MD_ALIGN_CENTER) {
-                            int left = pad / 2;
-                            int right = pad - left;
-                            for (int p = 0; p < left; p++) out_char(' ');
-                            if (cell->styled) out_str(cell->styled);
-                            for (int p = 0; p < right; p++) out_char(' ');
-                        } else {
-                            if (cell->styled) out_str(cell->styled);
-                            for (int p = 0; p < pad; p++) out_char(' ');
+            /* for each visual line of this logical row */
+            for (int vl = 0; vl < rlines; vl++) {
+                for (int ci = 0; ci < ncols; ci++) {
+                    MD_ALIGN a = c->tbl_aligns[ci];
+                    out_str(ANSI_RESET "\xe2\x94\x82");
+
+                    /* find the cell for (row, col) */
+                    TCell *cell = NULL;
+                    for (int cj = start; cj < end; cj++) {
+                        if (c->tbl_cells[cj].col == (unsigned)ci) {
+                            cell = &c->tbl_cells[cj];
+                            break;
                         }
-                        found = 1;
-                        break;
                     }
-                }
-                if (!found) {
-                    for (int p = 0; p < colw[ci]; p++) out_char(' ');
-                }
-                out_str(ANSI_RESET);
-            }
-            out_str(ANSI_RESET "\xe2\x94\x82" ANSI_RESET "\n");
 
-            /* separator after header or between rows */
+                    /* get this visual line's content */
+                    const char *content = "";
+                    if (cell && vl < cell->nwrapped)
+                        content = cell->wrapped[vl];
+
+                    int cw = dispw(content);
+                    int pad = colw[ci] - cw;
+
+                    if (a == MD_ALIGN_RIGHT) {
+                        for (int p = 0; p < pad; p++) out_char(' ');
+                        out_str(content);
+                    } else if (a == MD_ALIGN_CENTER) {
+                        int left = pad / 2;
+                        int right = pad - left;
+                        for (int p = 0; p < left; p++) out_char(' ');
+                        out_str(content);
+                        for (int p = 0; p < right; p++) out_char(' ');
+                    } else {
+                        out_str(content);
+                        for (int p = 0; p < pad; p++) out_char(' ');
+                    }
+                    out_str(ANSI_RESET);
+                }
+                out_str(ANSI_RESET "\xe2\x94\x82" ANSI_RESET "\n");
+            }
+
+            /* separator between logical rows */
             if (ri < header_rows - 1) {
-                /* between header rows */
                 BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
             } else if (ri == header_rows - 1 && ri + 1 < c->tbl_nrow) {
-                /* header/body separator */
                 BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
             } else if (ri < c->tbl_nrow - 1) {
-                /* between body rows */
                 BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
             }
         }
@@ -542,9 +731,17 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
         /* bottom border */
         BORDER("\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98", "\xe2\x94\x80");
 
-        /* free cell styled content */
+        /* ── 7. free cell data ───────────────────────────── */
         for (i = 0; i < c->tbl_ncell; i++) {
             free(c->tbl_cells[i].styled);
+            c->tbl_cells[i].styled = NULL;
+            if (c->tbl_cells[i].wrapped) {
+                for (int j = 0; j < c->tbl_cells[i].nwrapped; j++)
+                    free(c->tbl_cells[i].wrapped[j]);
+                free(c->tbl_cells[i].wrapped);
+                c->tbl_cells[i].wrapped = NULL;
+                c->tbl_cells[i].nwrapped = 0;
+            }
         }
         c->tbl_ncell = 0;
         c->tbl_nrow = 0;
@@ -657,7 +854,7 @@ static int text_cb(MD_TEXTTYPE type, const MD_CHAR *text, MD_SIZE size, void *us
  * Main
  * ════════════════════════════════════════════════════════════════ */
 
-static int process_file(FILE *in) {
+static int process_file(FILE *in, int max_width) {
     buffer buf;
     ctx c;
     int ret;
@@ -676,6 +873,7 @@ static int process_file(FILE *in) {
 
     memset(&c, 0, sizeof(c));
     c.bol = 1;
+    c.max_width = max_width;
 
     char *obuf = NULL;
     size_t osize = 0;
@@ -715,16 +913,32 @@ static int process_file(FILE *in) {
 
 int main(int argc, char **argv) {
     FILE *in = stdin;
+    int max_width = 0;   /* 0 = unlimited */
+    const char *fname = NULL;
 
-    if (argc > 1) {
-        in = fopen(argv[1], "rb");
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            max_width = atoi(argv[++i]);
+            if (max_width < 20) max_width = 20;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: mdrender [-w WIDTH] [file.md]\n");
+            printf("  -w WIDTH   max rendering width (default: unlimited)\n");
+            printf("  -h         show this help\n");
+            return 0;
+        } else if (argv[i][0] != '-') {
+            fname = argv[i];
+        }
+    }
+
+    if (fname) {
+        in = fopen(fname, "rb");
         if (!in) {
-            fprintf(stderr, "error: cannot open '%s'\n", argv[1]);
+            fprintf(stderr, "error: cannot open '%s'\n", fname);
             return 1;
         }
     }
 
-    int ret = process_file(in);
+    int ret = process_file(in, max_width);
     if (in != stdin) fclose(in);
     return ret;
 }

@@ -4,7 +4,7 @@
 
 | Left | Center | Right |
 | :--- | :----: | ----: |
-| **Bold** | `code` | *italic* |
+| **Bold** | `eryugruyjewgfyjuhgwgrfyjthgwergvbecodeeruihgvkrtughfvturyhgbjutryhh` | ***Bold italic 你好*** |
 | ~~strike~~ | plain | **`both`** |
 
 ## Table with multiple rows and columns
