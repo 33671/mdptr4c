@@ -6,6 +6,7 @@
 
 #include "md4c.h"
 #include "utils_ut8.h"
+#include "sds.h"
 
 #define ANSI_RESET      "\033[0m"
 #define ANSI_BOLD       "\033[1m"
@@ -33,29 +34,32 @@
 
 #define MAX_STYLES 64
 #define MAX_LISTS 16
+#define MAX_TCELLS 512
+#define MAX_TROWS 128
+#define MIN_COL_WIDTH 3
 
-static FILE *g_out;
+/* global output buffer: an SDS string that accumulates all rendered output */
+static sds g_out;
 
-/* ── growable buffer ─────────────────────────────────────────── */
+/* ── safe allocation (for non-sds heap objects) ──────────────── */
 
-typedef struct {
-    char *data;
-    size_t size;
-    size_t capacity;
-} buffer;
-
-static void buf_init(buffer *b) {
-    b->size = 0;
-    b->capacity = 4096;
-    b->data = malloc(b->capacity);
-    if (!b->data) { fprintf(stderr, "malloc failed\n"); exit(1); }
+static void *xmalloc(size_t size) {
+    void *p = sds_malloc(size);
+    if (!p) { fprintf(stderr, "malloc(%zu) failed\n", size); exit(1); }
+    return p;
 }
 
-static void buf_free(buffer *b) {
-    free(b->data);
-    b->data = NULL;
-    b->size = 0;
-    b->capacity = 0;
+static void *xrealloc(void *ptr, size_t size) {
+    void *p = sds_realloc(ptr, size);
+    if (!p) { fprintf(stderr, "realloc(%zu) failed\n", size); exit(1); }
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    size_t len = strlen(s);
+    char *p = xmalloc(len + 1);
+    memcpy(p, s, len + 1);
+    return p;
 }
 
 /* ── list tracking ───────────────────────────────────────────── */
@@ -70,16 +74,12 @@ typedef struct {
 /* ── table capture ──────────────────────────────────────────── */
 
 typedef struct {
-    char *styled;
-    size_t cap_size;
+    sds    styled;    /* full styled cell content (sds string) */
     unsigned col;
-    int is_header;
-    char **wrapped;     /* wrapped visual lines (malloc'd array of strings) */
-    int nwrapped;       /* number of wrapped lines */
+    int    is_header;
+    char **wrapped;   /* wrapped visual lines (malloc'd array of strings) */
+    int    nwrapped;  /* number of wrapped lines */
 } TCell;
-
-#define MAX_TCELLS 512
-#define MAX_TROWS 128
 
 /* ── render context ──────────────────────────────────────────── */
 
@@ -95,6 +95,7 @@ typedef struct {
     int in_li_count;
     int li_marker_emitted;
     int li_task_mark;
+    int li_indent_stack[MAX_LISTS];  /* continuation indent for each LI nesting level */
 
     int in_code_block;
     int code_is_fenced;
@@ -111,7 +112,7 @@ typedef struct {
     MD_ALIGN tbl_aligns[32];
     int tbl_in_cell;
     unsigned tbl_col;
-    FILE *tbl_saved;
+    sds tbl_saved;     /* saved g_out while rendering a table cell */
 
     TCell tbl_cells[MAX_TCELLS];
     int tbl_ncell;
@@ -155,10 +156,19 @@ static const char *span_ansi(MD_SPANTYPE type) {
     }
 }
 
-/* ── output helpers ──────────────────────────────────────────── */
+/* ── low-level output (all append into the global sds) ───────── */
 
-static void out_raw(const char *s, size_t len);
-static void out_str(const char *s);
+static void out_raw(const char *s, size_t len) { g_out = sdscatlen(g_out, s, len); }
+static void out_str(const char *s)            { g_out = sdscatlen(g_out, s, strlen(s)); }
+static void out_char(char c)                  { g_out = sdscatlen(g_out, &c, 1); }
+
+static void out_repeat(char c, int n) {
+    for (int i = 0; i < n; i++) out_char(c);
+}
+
+static void out_repeat_str(const char *s, int n) {
+    for (int i = 0; i < n; i++) out_str(s);
+}
 
 /* ── reapply full style context ──────────────────────────────── */
 
@@ -170,14 +180,6 @@ static void restyle(ctx *c) {
     if (c->in_html_block)     out_str(ANSI_DIM);
     for (int i = 0; i < c->style_depth; i++) out_str(span_ansi(c->styles[i]));
 }
-
-/* ── output helpers ──────────────────────────────────────────── */
-
-static void out_raw(const char *s, size_t len) { fwrite(s, 1, len, g_out); }
-
-static void out_str(const char *s) { fwrite(s, 1, strlen(s), g_out); }
-
-static void out_char(char c) { fwrite(&c, 1, 1, g_out); }
 
 /* count visible width in a possibly ANSI-escaped string (UTF-8 aware) */
 static int dispw(const char *s) {
@@ -198,11 +200,6 @@ static int dispw(const char *s) {
 
 /* ── wrap ANSI-styled text into lines ────────────────────────── */
 
-#define MIN_COL_WIDTH 3
-
-/* Wrap ANSI-styled text into lines of at most `max_w` display width.
- * Each line is properly styled by replaying active ANSI codes at its start.
- * Returns malloc'd array of malloc'd strings; sets *nlines. */
 static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
     if (!styled) styled = "";
     if (max_w < MIN_COL_WIDTH) max_w = MIN_COL_WIDTH;
@@ -210,7 +207,6 @@ static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
     size_t len = strlen(styled);
     size_t pos = 0;
 
-    /* dynamic array for collecting lines */
     char **lines = NULL;
     int line_cap = 0;
     *nlines = 0;
@@ -218,34 +214,27 @@ static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
     while (pos < len) {
         size_t line_start = pos;
         int col = 0;
-        int last_break = -1;   /* byte position of last space */
+        int last_break = -1;
 
-        /* scan characters in this visual line */
         int line_full = 0;
         while (pos < len && !line_full) {
             unsigned char c = (unsigned char)styled[pos];
 
             if (c == '\033') {
-                /* skip ANSI escape sequence */
                 while (pos < len && styled[pos] != 'm') pos++;
-                if (pos < len) pos++;  /* skip 'm' */
+                if (pos < len) pos++;
                 continue;
             }
 
-            if (c == ' ') {
-                last_break = (int)pos;
-            }
+            if (c == ' ') last_break = (int)pos;
 
             int cb, cw;
             cw = utf8_char_width(styled + pos, &cb);
             if (cw <= 0) { cw = 1; cb = 1; }
 
             if (col + cw > max_w) {
-                if (last_break >= 0 && last_break > (int)line_start) {
-                    /* break at last space (word boundary) */
+                if (last_break >= 0 && last_break > (int)line_start)
                     pos = (size_t)(last_break + 1);
-                }
-                /* else: hard break at current pos (mid-word) */
                 line_full = 1;
             } else {
                 col += cw;
@@ -254,15 +243,12 @@ static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
         }
 
         size_t line_end = pos;
-
-        /* trim trailing spaces */
         while (line_end > line_start && styled[line_end - 1] == ' ') line_end--;
 
-        /* determine active ANSI prefix at line_start by scanning from 0 */
+        /* determine active ANSI prefix at line_start */
         char prefix[512] = {0};
         int plen = 0;
-        size_t si = 0;
-        while (si < line_start) {
+        for (size_t si = 0; si < line_start;) {
             if (styled[si] == '\033') {
                 size_t ss = si;
                 while (si < line_start && styled[si] != 'm') si++;
@@ -270,7 +256,7 @@ static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
                 int sl = (int)(si - ss);
                 if (sl >= 3 && styled[ss + 2] == '0' &&
                     (sl == 4 || styled[ss + 3] == 'm')) {
-                    plen = 0;  /* ANSI_RESET clears active codes */
+                    plen = 0;
                 } else if (plen + sl < (int)sizeof(prefix) - 1) {
                     memcpy(prefix + plen, styled + ss, sl);
                     plen += sl;
@@ -283,81 +269,264 @@ static char **wrap_styled_text(const char *styled, int max_w, int *nlines) {
 
         /* build line: prefix + content + ANSI_RESET */
         size_t content_len = line_end - line_start;
-        char *line = malloc(plen + content_len + 5);
-        if (!line) { fprintf(stderr, "malloc failed\n"); exit(1); }
+        char *line = xmalloc(plen + content_len + 5);
         if (plen > 0) memcpy(line, prefix, plen);
         if (content_len > 0)
             memcpy(line + plen, styled + line_start, content_len);
         memcpy(line + plen + content_len, "\033[0m", 4);
         line[plen + content_len + 4] = '\0';
 
-        /* add to lines array */
         if (*nlines >= line_cap) {
             line_cap = line_cap ? line_cap * 2 : 8;
-            lines = realloc(lines, (size_t)line_cap * sizeof(char *));
-            if (!lines) { fprintf(stderr, "realloc failed\n"); exit(1); }
+            lines = xrealloc(lines, (size_t)line_cap * sizeof(char *));
         }
         lines[*nlines] = line;
         (*nlines)++;
 
-        /* skip leading spaces for next line */
         while (pos < len && styled[pos] == ' ') pos++;
     }
 
     if (*nlines == 0) {
-        lines = malloc(sizeof(char *));
-        if (!lines) { fprintf(stderr, "malloc failed\n"); exit(1); }
-        lines[0] = strdup("");
+        lines = xmalloc(sizeof(char *));
+        lines[0] = xstrdup("");
         *nlines = 1;
     }
-
     return lines;
+}
+
+/* ── handle BOL prefix (blockquote, list marker) ────────────── */
+
+static void handle_bol_prefix(ctx *c) {
+    if (!c->bol) return;
+
+    if (c->in_blockquote) {
+        out_str(ANSI_CYAN "> " ANSI_RESET);
+        restyle(c);
+    }
+
+    if (c->in_li_count > 0) {
+        if (!c->li_marker_emitted) {
+            c->li_marker_emitted = 1;
+            if (c->list_depth > 0) {
+                list_info *li = &c->list_stack[c->list_depth - 1];
+
+                int marker_indent = (c->list_depth - 1) * 2;
+                out_repeat(' ', marker_indent);
+
+                out_str(ANSI_YELLOW);
+                int marker_width = 0;
+                if (li->ordered) {
+                    char buf[32];
+                    int n = snprintf(buf, sizeof(buf), "%u%c ",
+                                     li->start + li->count - 1,
+                                     li->bullet ? li->bullet : '.');
+                    out_raw(buf, n);
+                    marker_width = n;
+                } else {
+                    if (li->bullet == '-' || li->bullet == '+') {
+                        out_char(li->bullet);
+                        out_char(' ');
+                        marker_width = 2;
+                    } else {
+                        out_str("\xe2\x80\xa2 ");
+                        marker_width = 2;
+                    }
+                }
+                if (c->li_task_mark) {
+                    out_str(ANSI_RESET " [");
+                    if (c->li_task_mark == 'x' || c->li_task_mark == 'X')
+                        out_str(ANSI_GREEN "x");
+                    else
+                        out_char(' ');
+                    out_str("]" ANSI_RESET);
+                    marker_width += 3;
+                    restyle(c);
+                }
+                c->li_indent_stack[c->in_li_count - 1] = marker_indent + marker_width;
+            }
+        } else {
+            out_repeat(' ', c->li_indent_stack[c->in_li_count - 1]);
+        }
+    }
+
+    c->bol = 0;
 }
 
 /* ── output text with line-prefix support ────────────────────── */
 
 static void emit_text(ctx *c, const char *text, MD_SIZE size) {
     if (size == 0) return;
+    handle_bol_prefix(c);
+    out_raw(text, size);
+}
 
-    if (c->bol && c->in_blockquote) {
-        out_str(ANSI_CYAN "> " ANSI_RESET);
-        restyle(c);
+/* ════════════════════════════════════════════════════════════════
+ * Table rendering helpers
+ * ════════════════════════════════════════════════════════════════ */
+
+static void tbl_calc_colw(ctx *c, int ncols, int *colw) {
+    int orig_colw[32] = {0};
+
+    for (int i = 0; i < c->tbl_ncell; i++) {
+        TCell *cell = &c->tbl_cells[i];
+        int w = sdslen(cell->styled) ? dispw(cell->styled) : 0;
+        if (w > orig_colw[cell->col]) orig_colw[cell->col] = w;
+    }
+    for (int i = 0; i < ncols; i++) {
+        if (orig_colw[i] < MIN_COL_WIDTH) orig_colw[i] = MIN_COL_WIDTH;
     }
 
-    if (c->in_li_count > 0 && !c->li_marker_emitted) {
-        c->li_marker_emitted = 1;
-        if (c->list_depth > 0) {
-            if (!c->bol) out_char('\n');
-            list_info *li = &c->list_stack[c->list_depth - 1];
-            out_str(ANSI_YELLOW);
-            if (li->ordered) {
-                char buf[32];
-                int n = snprintf(buf, sizeof(buf), "%u%c ",
-                                 li->start + li->count - 1,
-                                 li->bullet ? li->bullet : '.');
-                out_raw(buf, n);
-            } else {
-                if (li->bullet == '-' || li->bullet == '+') {
-                    out_char(li->bullet);
-                    out_char(' ');
-                } else {
-                    out_str("\xe2\x80\xa2 ");
+    memcpy(colw, orig_colw, ncols * sizeof(int));
+
+    if (c->max_width <= 0) return;
+
+    int total_orig = 0;
+    for (int i = 0; i < ncols; i++) total_orig += orig_colw[i];
+    int borders = ncols + 1;
+    int total = total_orig + borders;
+    if (total <= c->max_width) return;
+
+    int avail = c->max_width - borders;
+    for (int i = 0; i < ncols; i++) colw[i] = MIN_COL_WIDTH;
+    int remain = avail - ncols * MIN_COL_WIDTH;
+
+    while (remain > 0) {
+        int best = -1, best_gap = -1;
+        for (int i = 0; i < ncols; i++) {
+            int gap = orig_colw[i] - colw[i];
+            if (gap > best_gap) { best_gap = gap; best = i; }
+        }
+        if (best < 0 || best_gap <= 0) break;
+        colw[best]++;
+        remain--;
+    }
+}
+
+static void tbl_wrap_cells(ctx *c, int ncols, const int *colw) {
+    (void)ncols;
+    for (int i = 0; i < c->tbl_ncell; i++) {
+        TCell *cell = &c->tbl_cells[i];
+        cell->wrapped = wrap_styled_text(cell->styled,
+                                         colw[cell->col],
+                                         &cell->nwrapped);
+    }
+}
+
+static void tbl_row_lines(ctx *c, int *row_lines) {
+    for (int ri = 0; ri < c->tbl_nrow; ri++) {
+        int start = c->tbl_row_start[ri];
+        int end = (ri + 1 < c->tbl_nrow)
+                      ? c->tbl_row_start[ri + 1]
+                      : c->tbl_ncell;
+        int mx = 1;
+        for (int cj = start; cj < end; cj++) {
+            if (c->tbl_cells[cj].nwrapped > mx)
+                mx = c->tbl_cells[cj].nwrapped;
+        }
+        row_lines[ri] = mx;
+    }
+}
+
+static int tbl_count_headers(ctx *c) {
+    int n = 0;
+    for (int i = 0; i < c->tbl_nrow; i++) {
+        int start = c->tbl_row_start[i];
+        if (start < c->tbl_ncell && c->tbl_cells[start].is_header)
+            n++;
+        else
+            break;
+    }
+    return n;
+}
+
+static void tbl_border(const char *left, const char *mid,
+                       const char *right, const char *dash,
+                       int ncols, const int *colw) {
+    out_str(left);
+    for (int ci = 0; ci < ncols; ci++) {
+        out_repeat_str(dash, colw[ci]);
+        if (ci < ncols - 1) out_str(mid);
+    }
+    out_str(right);
+    out_str(ANSI_RESET "\n");
+}
+
+static void tbl_render(ctx *c, int ncols, const int *colw,
+                       const int *row_lines, int header_rows) {
+    tbl_border("\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90",
+               "\xe2\x94\x80", ncols, colw);
+
+    for (int ri = 0; ri < c->tbl_nrow; ri++) {
+        int start = c->tbl_row_start[ri];
+        int end = (ri + 1 < c->tbl_nrow)
+                      ? c->tbl_row_start[ri + 1]
+                      : c->tbl_ncell;
+        int rlines = row_lines[ri];
+
+        for (int vl = 0; vl < rlines; vl++) {
+            for (int ci = 0; ci < ncols; ci++) {
+                out_str(ANSI_RESET "\xe2\x94\x82");
+
+                TCell *cell = NULL;
+                for (int cj = start; cj < end; cj++) {
+                    if (c->tbl_cells[cj].col == (unsigned)ci) {
+                        cell = &c->tbl_cells[cj];
+                        break;
+                    }
                 }
+
+                const char *content = "";
+                if (cell && vl < cell->nwrapped)
+                    content = cell->wrapped[vl];
+
+                int cw = dispw(content);
+                int pad = colw[ci] - cw;
+                MD_ALIGN a = c->tbl_aligns[ci];
+
+                if (a == MD_ALIGN_RIGHT) {
+                    out_repeat(' ', pad);
+                    out_str(content);
+                } else if (a == MD_ALIGN_CENTER) {
+                    int left = pad / 2;
+                    out_repeat(' ', left);
+                    out_str(content);
+                    out_repeat(' ', pad - left);
+                } else {
+                    out_str(content);
+                    out_repeat(' ', pad);
+                }
+                out_str(ANSI_RESET);
             }
-            if (c->li_task_mark) {
-                out_str(ANSI_RESET " [");
-                if (c->li_task_mark == 'x' || c->li_task_mark == 'X')
-                    out_str(ANSI_GREEN "x");
-                else
-                    out_char(' ');
-                out_str("]" ANSI_RESET);
-                restyle(c);
-            }
+            out_str(ANSI_RESET "\xe2\x94\x82" ANSI_RESET "\n");
+        }
+
+        int need_sep = (ri < header_rows - 1) ||
+                       (ri == header_rows - 1 && ri + 1 < c->tbl_nrow) ||
+                       (ri >= header_rows && ri < c->tbl_nrow - 1);
+        if (need_sep) {
+            tbl_border("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4",
+                       "\xe2\x94\x80", ncols, colw);
         }
     }
 
-    c->bol = 0;
-    out_raw(text, size);
+    tbl_border("\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98",
+               "\xe2\x94\x80", ncols, colw);
+}
+
+static void tbl_free_cells(ctx *c) {
+    for (int i = 0; i < c->tbl_ncell; i++) {
+        sdsfree(c->tbl_cells[i].styled);
+        c->tbl_cells[i].styled = NULL;
+        if (c->tbl_cells[i].wrapped) {
+            for (int j = 0; j < c->tbl_cells[i].nwrapped; j++)
+                free(c->tbl_cells[i].wrapped[j]);
+            free(c->tbl_cells[i].wrapped);
+            c->tbl_cells[i].wrapped = NULL;
+            c->tbl_cells[i].nwrapped = 0;
+        }
+    }
+    c->tbl_ncell = 0;
+    c->tbl_nrow = 0;
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -413,7 +582,7 @@ static int enter_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
         MD_BLOCK_H_DETAIL *d = (MD_BLOCK_H_DETAIL *)detail;
         c->heading_level = d->level;
         out_str(heading_ansi(c->heading_level));
-        for (int i = 0; i < c->heading_level; i++) out_char('#');
+        out_repeat('#', c->heading_level);
         out_char(' ');
         c->bol = 0;
         break;
@@ -423,12 +592,7 @@ static int enter_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
         MD_BLOCK_CODE_DETAIL *d = (MD_BLOCK_CODE_DETAIL *)detail;
         c->in_code_block = 1;
         c->code_is_fenced = (d->fence_char != 0);
-        out_str(ANSI_DIM "  ");
-        if (c->code_is_fenced) {
-            out_str("```");
-        } else {
-            out_str("code");
-        }
+        out_str(c->code_is_fenced ? "```" : "code");
         if (d->lang.size > 0) {
             out_str(ANSI_RESET " " ANSI_BRIGHT_WHITE);
             out_raw(d->lang.text, d->lang.size);
@@ -452,7 +616,7 @@ static int enter_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
 
     case MD_BLOCK_HR:
         out_str(ANSI_DIM);
-        for (int i = 0; i < 72; i++) out_str("\xe2\x94\x80");
+        out_repeat_str("\xe2\x94\x80", 72);
         out_str(ANSI_RESET "\n");
         c->bol = 1;
         break;
@@ -488,11 +652,11 @@ static int enter_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
             c->tbl_aligns[c->tbl_col] = td->align;
         }
         c->tbl_in_cell = 1;
+
+        /* redirect output into a fresh sds for this cell */
         c->tbl_saved = g_out;
-        c->tbl_cells[c->tbl_ncell].cap_size = 0;
-        g_out = open_memstream(&c->tbl_cells[c->tbl_ncell].styled,
-                               &c->tbl_cells[c->tbl_ncell].cap_size);
-        if (!g_out) { fprintf(stderr, "open_memstream failed\n"); exit(1); }
+        g_out = sdsempty();
+
         c->tbl_cells[c->tbl_ncell].col = c->tbl_col;
         c->tbl_cells[c->tbl_ncell].is_header = (type == MD_BLOCK_TH);
         c->tbl_cells[c->tbl_ncell].wrapped = NULL;
@@ -535,7 +699,7 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
     case MD_BLOCK_CODE:
         out_str(ANSI_RESET);
         if (c->code_is_fenced)
-            out_str(ANSI_DIM "  ```" ANSI_RESET);
+            out_str(ANSI_DIM "```" ANSI_RESET);
         out_char('\n');
         c->in_code_block = 0;
         c->code_is_fenced = 0;
@@ -564,7 +728,8 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
     case MD_BLOCK_TH:
     case MD_BLOCK_TD:
         if (c->tbl_in_cell) {
-            fclose(g_out);
+            /* hand the sds we built to the cell and restore g_out */
+            c->tbl_cells[c->tbl_ncell].styled = g_out;
             g_out = c->tbl_saved;
             c->tbl_ncell++;
             c->tbl_col++;
@@ -573,178 +738,16 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
         break;
 
     case MD_BLOCK_TABLE: {
-        c->tbl_active = 0;
-        int i;
         int ncols = (int)c->tbl_cols;
-
-        /* ── 1. calculate original column widths ──────────── */
-        int orig_colw[32] = {0};
-        for (i = 0; i < c->tbl_ncell; i++) {
-            TCell *cell = &c->tbl_cells[i];
-            int w = cell->styled ? dispw(cell->styled) : 0;
-            if (w > orig_colw[cell->col]) orig_colw[cell->col] = w;
-        }
-        for (i = 0; i < ncols; i++) {
-            if (orig_colw[i] < MIN_COL_WIDTH) orig_colw[i] = MIN_COL_WIDTH;
-        }
-
-        /* ── 2. adjust colw if max_width is set ──────────── */
         int colw[32];
-        memcpy(colw, orig_colw, sizeof(colw));
-
-        if (c->max_width > 0) {
-            int total_orig = 0;
-            for (i = 0; i < ncols; i++) total_orig += orig_colw[i];
-            int borders = ncols + 1;   /* outer + inner separators */
-            int total = total_orig + borders;
-
-            if (total > c->max_width) {
-                int avail = c->max_width - borders;
-                /* start each column at MIN_COL_WIDTH */
-                for (i = 0; i < ncols; i++) colw[i] = MIN_COL_WIDTH;
-                int used = ncols * MIN_COL_WIDTH;
-                int remain = avail - used;
-
-                /* greedy: keep giving extra width to the column that
-                 * currently has the largest gap to its original width */
-                while (remain > 0) {
-                    int best = -1;
-                    int best_gap = -1;
-                    for (i = 0; i < ncols; i++) {
-                        int gap = orig_colw[i] - colw[i];
-                        if (gap > best_gap) {
-                            best_gap = gap;
-                            best = i;
-                        }
-                    }
-                    if (best < 0 || best_gap <= 0) break;
-                    colw[best]++;
-                    remain--;
-                }
-            }
-        }
-
-        /* ── 3. wrap cell content ────────────────────────── */
-        for (i = 0; i < c->tbl_ncell; i++) {
-            TCell *cell = &c->tbl_cells[i];
-            cell->wrapped = wrap_styled_text(cell->styled,
-                                             colw[cell->col],
-                                             &cell->nwrapped);
-        }
-
-        /* ── 4. find max visual lines per logical row ───── */
         int row_lines[MAX_TROWS];
-        for (int ri = 0; ri < c->tbl_nrow; ri++) {
-            int start = c->tbl_row_start[ri];
-            int end = (ri + 1 < c->tbl_nrow)
-                          ? c->tbl_row_start[ri + 1]
-                          : c->tbl_ncell;
-            int mx = 1;
-            for (int cj = start; cj < end; cj++) {
-                if (c->tbl_cells[cj].nwrapped > mx)
-                    mx = c->tbl_cells[cj].nwrapped;
-            }
-            row_lines[ri] = mx;
-        }
 
-        /* ── 5. count header rows ────────────────────────── */
-        int header_rows = 0;
-        for (i = 0; i < c->tbl_nrow; i++) {
-            int start = c->tbl_row_start[i];
-            if (start < c->tbl_ncell && c->tbl_cells[start].is_header)
-                header_rows++;
-            else
-                break;
-        }
-
-        /* helper macro for horizontal borders */
-        #define BORDER(left, mid, right, dash) \
-            out_str(left); \
-            for (int ci = 0; ci < ncols; ci++) { \
-                for (int j = 0; j < colw[ci]; j++) out_str(dash); \
-                if (ci < ncols - 1) out_str(mid); \
-            } \
-            out_str(right ANSI_RESET "\n");
-
-        /* ── 6. render ───────────────────────────────────── */
-        /* top border */
-        BORDER("\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90", "\xe2\x94\x80");
-
-        for (int ri = 0; ri < c->tbl_nrow; ri++) {
-            int start = c->tbl_row_start[ri];
-            int end = (ri + 1 < c->tbl_nrow)
-                          ? c->tbl_row_start[ri + 1]
-                          : c->tbl_ncell;
-            int rlines = row_lines[ri];
-
-            /* for each visual line of this logical row */
-            for (int vl = 0; vl < rlines; vl++) {
-                for (int ci = 0; ci < ncols; ci++) {
-                    MD_ALIGN a = c->tbl_aligns[ci];
-                    out_str(ANSI_RESET "\xe2\x94\x82");
-
-                    /* find the cell for (row, col) */
-                    TCell *cell = NULL;
-                    for (int cj = start; cj < end; cj++) {
-                        if (c->tbl_cells[cj].col == (unsigned)ci) {
-                            cell = &c->tbl_cells[cj];
-                            break;
-                        }
-                    }
-
-                    /* get this visual line's content */
-                    const char *content = "";
-                    if (cell && vl < cell->nwrapped)
-                        content = cell->wrapped[vl];
-
-                    int cw = dispw(content);
-                    int pad = colw[ci] - cw;
-
-                    if (a == MD_ALIGN_RIGHT) {
-                        for (int p = 0; p < pad; p++) out_char(' ');
-                        out_str(content);
-                    } else if (a == MD_ALIGN_CENTER) {
-                        int left = pad / 2;
-                        int right = pad - left;
-                        for (int p = 0; p < left; p++) out_char(' ');
-                        out_str(content);
-                        for (int p = 0; p < right; p++) out_char(' ');
-                    } else {
-                        out_str(content);
-                        for (int p = 0; p < pad; p++) out_char(' ');
-                    }
-                    out_str(ANSI_RESET);
-                }
-                out_str(ANSI_RESET "\xe2\x94\x82" ANSI_RESET "\n");
-            }
-
-            /* separator between logical rows */
-            if (ri < header_rows - 1) {
-                BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
-            } else if (ri == header_rows - 1 && ri + 1 < c->tbl_nrow) {
-                BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
-            } else if (ri < c->tbl_nrow - 1) {
-                BORDER("\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4", "\xe2\x94\x80");
-            }
-        }
-
-        /* bottom border */
-        BORDER("\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98", "\xe2\x94\x80");
-
-        /* ── 7. free cell data ───────────────────────────── */
-        for (i = 0; i < c->tbl_ncell; i++) {
-            free(c->tbl_cells[i].styled);
-            c->tbl_cells[i].styled = NULL;
-            if (c->tbl_cells[i].wrapped) {
-                for (int j = 0; j < c->tbl_cells[i].nwrapped; j++)
-                    free(c->tbl_cells[i].wrapped[j]);
-                free(c->tbl_cells[i].wrapped);
-                c->tbl_cells[i].wrapped = NULL;
-                c->tbl_cells[i].nwrapped = 0;
-            }
-        }
-        c->tbl_ncell = 0;
-        c->tbl_nrow = 0;
+        tbl_calc_colw(c, ncols, colw);
+        tbl_wrap_cells(c, ncols, colw);
+        tbl_row_lines(c, row_lines);
+        int header_rows = tbl_count_headers(c);
+        tbl_render(c, ncols, colw, row_lines, header_rows);
+        tbl_free_cells(c);
 
         out_char('\n');
         c->bol = 1;
@@ -765,6 +768,7 @@ static int enter_span_cb(MD_SPANTYPE type, void *detail, void *userdata) {
 
     if (type == MD_SPAN_IMG) {
         MD_SPAN_IMG_DETAIL *d = (MD_SPAN_IMG_DETAIL *)detail;
+        handle_bol_prefix(c);
         out_str(ANSI_DIM ANSI_YELLOW "[IMG:");
         if (d->src.size > 0) {
             out_char(' ');
@@ -776,7 +780,10 @@ static int enter_span_cb(MD_SPANTYPE type, void *detail, void *userdata) {
     }
 
     restyle(c);
-    if (type == MD_SPAN_CODE) out_str("`");
+    if (type == MD_SPAN_CODE) {
+        handle_bol_prefix(c);
+        out_str("`");
+    }
     return 0;
 }
 
@@ -786,13 +793,17 @@ static int leave_span_cb(MD_SPANTYPE type, void *detail, void *userdata) {
     if (type == MD_SPAN_A) {
         MD_SPAN_A_DETAIL *d = (MD_SPAN_A_DETAIL *)detail;
         if (d->href.size > 0) {
+            handle_bol_prefix(c);
             out_str(ANSI_DIM " <");
             out_raw(d->href.text, d->href.size);
             out_str(">" ANSI_RESET);
         }
     }
 
-    if (type == MD_SPAN_CODE) out_str("`");
+    if (type == MD_SPAN_CODE) {
+        handle_bol_prefix(c);
+        out_str("`");
+    }
 
     if (c->style_depth > 0)
         c->style_depth--;
@@ -855,30 +866,24 @@ static int text_cb(MD_TEXTTYPE type, const MD_CHAR *text, MD_SIZE size, void *us
  * ════════════════════════════════════════════════════════════════ */
 
 static int process_file(FILE *in, int max_width) {
-    buffer buf;
     ctx c;
     int ret;
 
-    buf_init(&buf);
-    while (1) {
-        if (buf.size >= buf.capacity) {
-            buf.capacity += buf.capacity / 2;
-            buf.data = realloc(buf.data, buf.capacity);
-            if (!buf.data) { fprintf(stderr, "realloc failed\n"); exit(1); }
-        }
-        size_t n = fread(buf.data + buf.size, 1, buf.capacity - buf.size, in);
-        if (n == 0) break;
-        buf.size += n;
+    /* read entire input into an sds */
+    sds input = sdsempty();
+    {
+        char tmp[4096];
+        size_t n;
+        while ((n = fread(tmp, 1, sizeof(tmp), in)) > 0)
+            input = sdscatlen(input, tmp, n);
     }
 
     memset(&c, 0, sizeof(c));
     c.bol = 1;
     c.max_width = max_width;
 
-    char *obuf = NULL;
-    size_t osize = 0;
-    g_out = open_memstream(&obuf, &osize);
-    if (!g_out) { fprintf(stderr, "open_memstream failed\n"); exit(1); }
+    /* fresh output buffer */
+    g_out = sdsempty();
 
     MD_PARSER parser;
     memset(&parser, 0, sizeof(parser));
@@ -897,23 +902,23 @@ static int process_file(FILE *in, int max_width) {
     parser.leave_span = leave_span_cb;
     parser.text = text_cb;
 
-    sanitize_utf8((uint8_t *)buf.data, buf.size);
+    sanitize_utf8((uint8_t *)input, sdslen(input));
 
-    ret = md_parse(buf.data, (MD_SIZE)buf.size, &parser, &c);
+    ret = md_parse(input, (MD_SIZE)sdslen(input), &parser, &c);
 
+    /* flush and write */
     out_str(ANSI_RESET);
-    fclose(g_out);
+    fwrite(g_out, 1, sdslen(g_out), stdout);
+    sdsfree(g_out);
     g_out = NULL;
-    fwrite(obuf, 1, osize, stdout);
-    free(obuf);
+    sdsfree(input);
 
-    buf_free(&buf);
     return ret;
 }
 
 int main(int argc, char **argv) {
     FILE *in = stdin;
-    int max_width = 0;   /* 0 = unlimited */
+    int max_width = 0;
     const char *fname = NULL;
 
     for (int i = 1; i < argc; i++) {
