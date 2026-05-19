@@ -1,0 +1,20 @@
+# ===== 编译产物 =====
+mdrender
+mdrender_asan
+
+# ===== Markdown 文件（全部忽略） =====
+*.md
+
+# ===== 编译中间文件 =====
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# ===== 编辑器/系统临时文件 =====
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
