@@ -2,8 +2,10 @@
 mdrender
 mdrender_asan
 
-# ===== Markdown 文件（全部忽略） =====
+# ===== Markdown 文件（除许可证文件外全部忽略） =====
 *.md
+!md4c/LICENSE.md
+!md4c/test/LICENSE.md
 
 # ===== 编译中间文件 =====
 *.o
