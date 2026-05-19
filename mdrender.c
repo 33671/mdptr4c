@@ -699,7 +699,7 @@ static int leave_block_cb(MD_BLOCKTYPE type, void *detail, void *userdata) {
     case MD_BLOCK_CODE:
         out_str(ANSI_RESET);
         if (c->code_is_fenced)
-            out_str(ANSI_DIM "```" ANSI_RESET);
+            out_str("```");
         out_char('\n');
         c->in_code_block = 0;
         c->code_is_fenced = 0;
